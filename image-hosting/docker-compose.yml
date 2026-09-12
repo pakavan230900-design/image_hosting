@@ -1,0 +1,20 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000" 
+    volumes:
+      - ./images:/app/images
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"     
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./images:/usr/share/nginx/images:ro
+    depends_on:
+      - app
+    restart: unless-stopped

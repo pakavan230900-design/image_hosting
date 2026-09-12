@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>Сервер зображень</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Сервер зображень</h1>
+    <p>Завантаж зображення (.jpg, .png, .gif, до 5 МБ) і отримай пряме посилання на нього.</p>
+
+    <form id="upload-form">
+      <input type="file" id="file-input" name="file" accept=".jpg,.jpeg,.png,.gif" required>
+      <button type="submit">Завантажити</button>
+    </form>
+
+    <div id="result"></div>
+
+    <p><a href="/images/"><button type="button">Переглянути каталог зображень</button></a></p>
+  </div>
+
+  <script>
+    document.getElementById('upload-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+
+      const fileInput = document.getElementById('file-input');
+      const resultDiv = document.getElementById('result');
+      resultDiv.textContent = '';
+      resultDiv.className = '';
+
+      if (!fileInput.files.length) {
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+
+      try {
+        const response = await fetch('/upload', {
+          method: 'POST',
+          body: formData,
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+          resultDiv.className = 'success';
+          resultDiv.innerHTML = `Успіх! Файл завантажено: <a href="${data.url}" target="_blank">${data.filename}</a>`;
+          fileInput.value = '';
+        } else {
+          resultDiv.className = 'error';
+          resultDiv.textContent = 'Помилка: ' + data.error;
+        }
+      } catch (err) {
+        resultDiv.className = 'error';
+        resultDiv.textContent = 'Помилка мережі: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
