@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    ports:
+    expose:
       - "8000:8000" 
     volumes:
       - ./images:/app/images

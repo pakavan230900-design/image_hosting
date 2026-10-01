@@ -2,6 +2,4 @@ venv/
 __pycache__/
 *.pyc
 images/*
-!images/.gitkeep
 logs/*
-!logs/.gitkeep
