@@ -10,6 +10,7 @@ images/*
 !images/.gitkeep
 logs/*
 !logs/.gitkeep
+backups/
 ../README.md
 docker-compose.yml
  
