@@ -8,7 +8,7 @@ WORKDIR /app
 COPY --from=builder /root/.local /root/.local
 ENV PATH=/root/.local/bin:$PATH
 COPY app.py .
-COPY static/ ./static/
+COPY static ./static/
 
 RUN mkdir -p images logs 
 EXPOSE 8000 

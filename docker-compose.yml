@@ -1,6 +1,6 @@
 services:
   app:
-    build: .
+    build: image-hosting
     expose:
       - "8000:8000" 
     volumes:
