@@ -2,4 +2,7 @@ venv/
 __pycache__/
 *.pyc
 images/*
-logs/*.idea
+!images/.gitkeep
+logs/*
+!logs/.gitkeep
+.DS_Store
