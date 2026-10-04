@@ -5,9 +5,11 @@ import uuid
 import json
 import logging
 import mimetypes
+import time
 
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
+import psycopg2
 
 PORT = 8000
 BASE_DIR = Path(__file__).resolve().parent
@@ -15,16 +17,32 @@ IMAGES_DIR = BASE_DIR / "images"
 LOGS_DIR = BASE_DIR / "logs"
 STATIC_DIR = BASE_DIR / "static"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
-MAX_FILE_SIZE = 5 * 1024 * 1024 
+MAX_FILE_SIZE = 5 * 1024 * 1024
 ALLOWED_PIL_FORMATS = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
     ".png": "PNG",
     ".gif": "GIF"}
+DB_CONFIG = {
+    "dbname": os.getenv("DB_NAME", "images_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", "password"),
+    "host": os.getenv("DB_HOST", "db"),
+    "port": os.getenv("DB_PORT", "5432"),
+}
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS images (
+    id SERIAL PRIMARY KEY,
+    filename TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    file_type TEXT NOT NULL
+);
+"""
 IMAGES_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
-
 
 logging.basicConfig(
     filename=LOGS_DIR / "app.log",
@@ -32,6 +50,43 @@ logging.basicConfig(
     format="[%(asctime)s] Дія: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
 logging.getLogger().addHandler(logging.StreamHandler())
+
+
+def get_db_connection():
+    """Нове з'єднання з PostgreSQL для кожного запиту (безпечно для потоків)."""
+    return psycopg2.connect(**DB_CONFIG, connect_timeout=5)
+
+
+def init_db(retries: int = 10, delay: int = 2):
+    """Перевіряє з'єднання з БД і створює таблицю images, якщо її ще немає."""
+    for attempt in range(1, retries + 1):
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(CREATE_TABLE_SQL)
+                conn.commit()
+            finally:
+                conn.close()
+            logging.info("Успіх: з'єднання з базою даних встановлено, таблиця images готова.")
+            return
+        except psycopg2.Error as e:
+            logging.error(
+                f"Помилка: не вдалося підключитися до бази даних "
+                f"(спроба {attempt}/{retries}): {e}")
+            time.sleep(delay)
+    logging.error("Помилка: база даних недоступна, сервер запускається без неї.")
+
+
+def save_metadata(cursor, filename, original_name, size, file_type):
+    """Додає запис про зображення і повертає його id."""
+    query = """
+    INSERT INTO images (filename, original_name, size, file_type)
+    VALUES (%s, %s, %s, %s)
+    RETURNING id
+    """
+    cursor.execute(query, (filename, original_name, size, file_type))
+    return cursor.fetchone()[0]
 
 
 class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
@@ -100,7 +155,7 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
                 f"Помилка: файл перевищує ліміт розміру ({content_length} байт).")
             self._send_json_error(400, "Файл перевищує максимальний розмір 5 МБ")
             return
-        
+
         body = self.rfile.read(content_length)
         filename, file_bytes = self._parse_multipart(body, content_type)
 
@@ -138,15 +193,59 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
 
         unique_name = f"{uuid.uuid4().hex}{ext}"
         save_path = IMAGES_DIR / unique_name
-        with open(save_path, "wb") as f:
-            f.write(file_bytes)
+        original_name = os.path.basename(filename)
+        file_type = ext.lstrip(".")
 
-        logging.info(f"Успіх: зображення {unique_name} завантажено.")
+        # Порядок: запис у БД -> файл на диск -> commit.
+        # Якщо БД недоступна або запис не вдався, файл на диску не з'являється.
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                image_id = save_metadata(
+                    cur, unique_name, original_name, len(file_bytes), file_type)
+            with open(save_path, "wb") as f:
+                f.write(file_bytes)
+            conn.commit()
+        except psycopg2.Error as e:
+            self._rollback_upload(conn, save_path)
+            logging.error(
+                f"Помилка: не вдалося зберегти метадані файлу {original_name} "
+                f"в базі даних, файл не збережено. Причина: {e}")
+            self._send_json_error(500, "Помилка бази даних, файл не збережено")
+            return
+        except OSError as e:
+            self._rollback_upload(conn, save_path)
+            logging.error(
+                f"Помилка: не вдалося записати файл {unique_name} на диск. Причина: {e}")
+            self._send_json_error(500, "Не вдалося зберегти файл на сервері")
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        logging.info(
+            f"Успіх: зображення {unique_name} (оригінал: {original_name}, "
+            f"{len(file_bytes)} байт, id={image_id}) завантажено.")
 
         self._send_json(200, {
             "message": "Файл успішно завантажено",
+            "id": image_id,
             "filename": unique_name,
             "url": f"/images/{unique_name}"})
+
+    @staticmethod
+    def _rollback_upload(conn, save_path: Path):
+        """Відкочує транзакцію і прибирає файл, якщо він встиг записатися."""
+        if conn is not None:
+            try:
+                conn.rollback()
+            except psycopg2.Error:
+                pass
+        try:
+            save_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _handle_image_serve(self):
         filename = self.path[len("/images/"):]
@@ -234,7 +333,9 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run():
+    init_db()
     with http.server.ThreadingHTTPServer(("0.0.0.0", PORT), ImageHostingHandler) as httpd:
         print(f"Сервер запущено на порту {PORT} (http://localhost:{PORT})")
         httpd.serve_forever()
