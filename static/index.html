@@ -33,23 +33,39 @@
         return;
       }
 
+      const file = fileInput.files[0];
+
       const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
+      formData.append('file', file);
 
       try {
         const response = await fetch('/upload', {
           method: 'POST',
           body: formData,
         });
-        const data = await response.json();
+        // Відповідь може бути не JSON (наприклад, HTML-сторінка помилки від Nginx)
+        let data = null;
+        try {
+          data = await response.json();
+        } catch (_) {
+          data = null;
+        }
 
-        if (response.ok) {
+        if (response.ok && data) {
           resultDiv.className = 'success';
           resultDiv.innerHTML = `Успіх! Файл завантажено: <a href="${data.url}" target="_blank">${data.filename}</a>`;
           fileInput.value = '';
         } else {
+          let message;
+          if (data && data.error) {
+            message = data.error;
+          } else if (response.status === 413) {
+            message = 'файл перевищує максимальний розмір 5 МБ';
+          } else {
+            message = 'сервер повернув помилку ' + response.status;
+          }
           resultDiv.className = 'error';
-          resultDiv.textContent = 'Помилка: ' + data.error;
+          resultDiv.textContent = 'Помилка: ' + message;
         }
       } catch (err) {
         resultDiv.className = 'error';

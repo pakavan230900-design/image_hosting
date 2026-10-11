@@ -9,7 +9,7 @@ import mimetypes
 import time
 
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from PIL import Image, UnidentifiedImageError
 import psycopg2
 
@@ -20,6 +20,7 @@ LOGS_DIR = BASE_DIR / "logs"
 STATIC_DIR = BASE_DIR / "static"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
+PER_PAGE = 10
 ALLOWED_PIL_FORMATS = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
@@ -104,13 +105,20 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             self._handle_image_serve()
         elif self.path.startswith("/static/"):
             self._handle_static()
+        elif path == "/favicon.ico":
+            # Браузер запитує іконку автоматично; відповідаємо "немає вмісту",
+            # щоб не засмічувати лог помилками 404.
+            self.send_response(204)
+            self.end_headers()
         else:
+            logging.info(f"Помилка: маршрут GET {self.path} не знайдено.")
             self._send_error(404, "Маршрут не знайдено")
 
     def do_POST(self):
         if self.path == "/upload":
             self._handle_upload()
         else:
+            logging.info(f"Помилка: маршрут POST {self.path} не знайдено.")
             self._send_error(404, "Маршрут не знайдено")
 
     def _handle_index(self):
@@ -120,19 +128,30 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         filename = self.path[len("/static/"):]
         requested_path = (STATIC_DIR / filename).resolve()
         if STATIC_DIR.resolve() not in requested_path.parents:
+            logging.info(f"Помилка: спроба доступу за межі дозволеної папки ({self.path}).")
             self._send_error(403, "Доступ заборонено")
             return
         content_type = mimetypes.guess_type(str(requested_path))[0] or "application/octet-stream"
         self._serve_file(requested_path, content_type)
 
     def _handle_images_list(self):
+        page = self._get_page_number()
         try:
             conn = get_db_connection()
             try:
                 with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM images")
+                    total = cur.fetchone()[0]
+
+                    total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+                    page = min(page, total_pages)
+                    offset = (page - 1) * PER_PAGE
+
                     cur.execute(
                         "SELECT id, filename, original_name, size, upload_time, file_type "
-                        "FROM images ORDER BY upload_time DESC, id DESC")
+                        "FROM images ORDER BY upload_time DESC, id DESC "
+                        "LIMIT %s OFFSET %s",
+                        (PER_PAGE, offset))
                     rows = cur.fetchall()
             finally:
                 conn.close()
@@ -148,8 +167,45 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
                 '<tr><td colspan="5" class="empty">Немає завантажених зображень</td></tr>')
 
         template = (STATIC_DIR / "images_list.html").read_text(encoding="utf-8")
-        page = template.replace("<!--ROWS-->", table_rows)
-        self._send_html(200, page)
+        page_html = (template
+                     .replace("<!--ROWS-->", table_rows)
+                     .replace("<!--PAGINATION-->",
+                              self._render_pagination(page, total_pages, total)))
+        self._send_html(200, page_html)
+
+    def _get_page_number(self) -> int:
+        """Номер сторінки з ?page=N. Некоректне або менше 1 значення -> 1."""
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            page = int(query.get("page", ["1"])[0])
+        except ValueError:
+            return 1
+        return max(page, 1)
+
+    @staticmethod
+    def _render_pagination(page: int, total_pages: int, total: int) -> str:
+        if total == 0:
+            return ""
+
+        if page > 1:
+            prev_btn = (f'<a class="page-btn" href="/images-list?page={page - 1}">'
+                        "&larr; Попередня сторінка</a>")
+        else:
+            prev_btn = '<span class="page-btn disabled">&larr; Попередня сторінка</span>'
+
+        if page < total_pages:
+            next_btn = (f'<a class="page-btn" href="/images-list?page={page + 1}">'
+                        "Наступна сторінка &rarr;</a>")
+        else:
+            next_btn = '<span class="page-btn disabled">Наступна сторінка &rarr;</span>'
+
+        return (
+            '<nav class="pagination">'
+            f"{prev_btn}"
+            f'<span class="page-info">Сторінка {page} з {total_pages} '
+            f"(всього зображень: {total})</span>"
+            f"{next_btn}"
+            "</nav>")
 
     @staticmethod
     def _render_image_row(row) -> str:
@@ -171,17 +227,24 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
     def _handle_upload(self):
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
+            logging.info(
+                f"Помилка: некоректний Content-Type запиту на завантаження ({content_type}).")
             self._send_json_error(400, "Очікується Content-Type: multipart/form-data")
             return
         try:
             content_length = int(self.headers.get("Content-Length", 0))
         except ValueError:
+            logging.info("Помилка: некоректний Content-Length у запиті на завантаження.")
             self._send_json_error(400, "Некоректний Content-Length")
             return
         if content_length <= 0:
+            logging.info("Помилка: порожнє тіло запиту на завантаження.")
             self._send_json_error(400, "Порожнє тіло запиту")
             return
         if content_length > MAX_FILE_SIZE:
+            # Дочитуємо тіло запиту, інакше з'єднання обірветься
+            # і Nginx замість нашої відповіді поверне 502.
+            self._discard_body(content_length)
             logging.info(
                 f"Помилка: файл перевищує ліміт розміру ({content_length} байт).")
             self._send_json_error(400, "Файл перевищує максимальний розмір 5 МБ")
@@ -265,6 +328,15 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             "filename": unique_name,
             "url": f"/images/{unique_name}"})
 
+    def _discard_body(self, length: int):
+        """Читає і відкидає тіло запиту шматками, не тримаючи його в пам'яті."""
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     @staticmethod
     def _rollback_upload(conn, save_path: Path):
         """Відкочує транзакцію і прибирає файл, якщо він встиг записатися."""
@@ -283,6 +355,7 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         requested_path = (IMAGES_DIR / filename).resolve()
 
         if IMAGES_DIR.resolve() not in requested_path.parents:
+            logging.info(f"Помилка: спроба доступу за межі дозволеної папки ({self.path}).")
             self._send_error(403, "Доступ заборонено")
             return
 
@@ -314,6 +387,7 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_file(self, path: Path, content_type: str):
         if not path.is_file():
+            logging.info(f"Помилка: файл {self.path} не знайдено.")
             self._send_error(404, "Файл не знайдено")
             return
 
