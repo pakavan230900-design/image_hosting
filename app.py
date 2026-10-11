@@ -23,18 +23,20 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
 PER_PAGE = 10
 DELETE_ROUTE = re.compile(r"^/delete/(\d+)$")
+
 ALLOWED_PIL_FORMATS = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
     ".png": "PNG",
     ".gif": "GIF"}
+
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME", "images_db"),
     "user": os.getenv("DB_USER", "postgres"),
     "password": os.getenv("DB_PASSWORD", "password"),
     "host": os.getenv("DB_HOST", "db"),
-    "port": os.getenv("DB_PORT", "5432"),
-}
+    "port": os.getenv("DB_PORT", "5432")}
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS images (
     id SERIAL PRIMARY KEY,
@@ -42,9 +44,8 @@ CREATE TABLE IF NOT EXISTS images (
     original_name TEXT NOT NULL,
     size INTEGER NOT NULL,
     upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    file_type TEXT NOT NULL
-);
-"""
+    file_type TEXT NOT NULL);"""
+
 IMAGES_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
@@ -58,12 +59,10 @@ logging.getLogger().addHandler(logging.StreamHandler())
 
 
 def get_db_connection():
-    """Нове з'єднання з PostgreSQL для кожного запиту (безпечно для потоків)."""
     return psycopg2.connect(**DB_CONFIG, connect_timeout=5)
 
 
 def init_db(retries: int = 10, delay: int = 2):
-    """Перевіряє з'єднання з БД і створює таблицю images, якщо її ще немає."""
     for attempt in range(1, retries + 1):
         try:
             conn = get_db_connection()
@@ -84,12 +83,11 @@ def init_db(retries: int = 10, delay: int = 2):
 
 
 def save_metadata(cursor, filename, original_name, size, file_type):
-    """Додає запис про зображення і повертає його id."""
     query = """
     INSERT INTO images (filename, original_name, size, file_type)
     VALUES (%s, %s, %s, %s)
-    RETURNING id
-    """
+    RETURNING id"""
+
     cursor.execute(query, (filename, original_name, size, file_type))
     return cursor.fetchone()[0]
 
@@ -119,8 +117,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/favicon.ico":
-            # Браузер запитує іконку автоматично; відповідаємо "немає вмісту",
-            # щоб не засмічувати лог помилками 404.
             self.send_response(204)
             self.end_headers()
         else:
@@ -191,7 +187,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         self._send_html(200, page_html)
 
     def _handle_delete(self, image_id: int):
-        """Видаляє запис з БД і файл з диска, потім повертає на список."""
         page = self._get_page_number()
         back_url = f"/images-list?page={page}"
 
@@ -211,7 +206,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
                 filename = row[0]
                 cur.execute("DELETE FROM images WHERE id = %s", (image_id,))
 
-            # Файл видаляємо до commit: якщо не вийде, запис у БД залишиться.
             file_path = (IMAGES_DIR / filename).resolve()
             if IMAGES_DIR.resolve() not in file_path.parents:
                 conn.rollback()
@@ -249,7 +243,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         self._redirect(back_url)
 
     def _get_page_number(self) -> int:
-        """Номер сторінки з ?page=N. Некоректне або менше 1 значення -> 1."""
         query = parse_qs(urlparse(self.path).query)
         try:
             page = int(query.get("page", ["1"])[0])
@@ -323,8 +316,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             self._send_json_error(400, "Порожнє тіло запиту")
             return
         if content_length > MAX_FILE_SIZE:
-            # Дочитуємо тіло запиту, інакше з'єднання обірветься
-            # і Nginx замість нашої відповіді поверне 502.
             self._discard_body(content_length)
             logging.info(
                 f"Помилка: файл перевищує ліміт розміру ({content_length} байт).")
@@ -371,14 +362,11 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         original_name = os.path.basename(filename)
         file_type = ext.lstrip(".")
 
-        # Порядок: запис у БД -> файл на диск -> commit.
-        # Якщо БД недоступна або запис не вдався, файл на диску не з'являється.
         conn = None
         try:
             conn = get_db_connection()
             with conn.cursor() as cur:
-                image_id = save_metadata(
-                    cur, unique_name, original_name, len(file_bytes), file_type)
+                image_id = save_metadata(cur, unique_name, original_name, len(file_bytes), file_type)
             with open(save_path, "wb") as f:
                 f.write(file_bytes)
             conn.commit()
@@ -410,7 +398,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             "url": f"/images/{unique_name}"})
 
     def _discard_body(self, length: int):
-        """Читає і відкидає тіло запиту шматками, не тримаючи його в пам'яті."""
         remaining = length
         while remaining > 0:
             chunk = self.rfile.read(min(remaining, 64 * 1024))
@@ -420,7 +407,6 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def _rollback_upload(conn, save_path: Path):
-        """Відкочує транзакцію і прибирає файл, якщо він встиг записатися."""
         if conn is not None:
             try:
                 conn.rollback()
