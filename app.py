@@ -3,11 +3,13 @@ import io
 import os
 import uuid
 import json
+import html
 import logging
 import mimetypes
 import time
 
 from pathlib import Path
+from urllib.parse import urlparse
 from PIL import Image, UnidentifiedImageError
 import psycopg2
 
@@ -91,10 +93,13 @@ def save_metadata(cursor, filename, original_name, size, file_type):
 
 class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
+        path = urlparse(self.path).path
+        if path == "/":
             self._handle_index()
-        elif self.path in ("/images", "/images/"):
-            self._handle_image_list()
+        elif path == "/images-list":
+            self._handle_images_list()
+        elif path in ("/images", "/images/"):
+            self._redirect("/images-list")
         elif self.path.startswith("/images/"):
             self._handle_image_serve()
         elif self.path.startswith("/static/"):
@@ -120,22 +125,48 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(str(requested_path))[0] or "application/octet-stream"
         self._serve_file(requested_path, content_type)
 
-    def _handle_image_list(self):
-        files = sorted(p.name for p in IMAGES_DIR.iterdir() if p.is_file())
-        if files:
-            items = "\n".join(
-                f'<li><a href="/images/{name}" target="_blank">{name}</a></li>'
-                for name in files)
+    def _handle_images_list(self):
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, filename, original_name, size, upload_time, file_type "
+                        "FROM images ORDER BY upload_time DESC, id DESC")
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+        except psycopg2.Error as e:
+            logging.error(f"Помилка: не вдалося отримати список зображень з бази даних. Причина: {e}")
+            self._send_error(500, "Помилка бази даних, спробуйте пізніше")
+            return
+
+        if rows:
+            table_rows = "\n".join(self._render_image_row(row) for row in rows)
         else:
-            items = "<li>Поки що немає завантажених зображень.</li>"
-        template = (STATIC_DIR / "catalog.html").read_text(encoding="utf-8")
-        html = template.replace("<!--ITEMS-->", items)
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            table_rows = (
+                '<tr><td colspan="5" class="empty">Немає завантажених зображень</td></tr>')
+
+        template = (STATIC_DIR / "images_list.html").read_text(encoding="utf-8")
+        page = template.replace("<!--ROWS-->", table_rows)
+        self._send_html(200, page)
+
+    @staticmethod
+    def _render_image_row(row) -> str:
+        image_id, filename, original_name, size, upload_time, file_type = row
+        name = html.escape(filename)
+        original = html.escape(original_name)
+        size_kb = f"{size / 1024:.1f}"
+        uploaded = (upload_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if hasattr(upload_time, "strftime") else str(upload_time))
+        return (
+            "<tr>"
+            f'<td><a href="/images/{name}" target="_blank">{name}</a></td>'
+            f"<td>{original}</td>"
+            f'<td class="num">{size_kb}</td>'
+            f"<td>{uploaded}</td>"
+            f"<td>{html.escape(file_type)}</td>"
+            "</tr>")
 
     def _handle_upload(self):
         content_type = self.headers.get("Content-Type", "")
@@ -257,6 +288,20 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
 
         content_type = mimetypes.guess_type(str(requested_path))[0] or "application/octet-stream"
         self._serve_file(requested_path, content_type)
+
+    def _send_html(self, status: int, page: str):
+        body = page.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location: str):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send_error(self, status: int, message: str):
 
