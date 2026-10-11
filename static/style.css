@@ -163,3 +163,19 @@ a {
     color: #4b5563;
     font-size: 0.95rem;
 }
+/* ---------- Кнопка видалення ---------- */
+
+.images-table form.delete-form {
+    margin: 0;
+    display: inline;
+}
+
+.delete-btn {
+    background-color: #dc2626;
+    font-size: 0.85rem;
+    padding: 6px 12px;
+}
+
+.delete-btn:hover {
+    background-color: #b91c1c;
+}

@@ -6,6 +6,7 @@ import json
 import html
 import logging
 import mimetypes
+import re
 import time
 
 from pathlib import Path
@@ -21,6 +22,7 @@ STATIC_DIR = BASE_DIR / "static"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
 PER_PAGE = 10
+DELETE_ROUTE = re.compile(r"^/delete/(\d+)$")
 ALLOWED_PIL_FORMATS = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
@@ -105,6 +107,17 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             self._handle_image_serve()
         elif self.path.startswith("/static/"):
             self._handle_static()
+        elif path.startswith("/delete/"):
+            logging.info(f"Помилка: спроба видалення методом GET ({self.path}), потрібен POST.")
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            body = ("<html><body><h1>405</h1><p>Видалення виконується тільки методом POST "
+                    "через кнопку \"Видалити\" на сторінці "
+                    '<a href="/images-list">списку зображень</a>.</p></body></html>').encode("utf-8")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/favicon.ico":
             # Браузер запитує іконку автоматично; відповідаємо "немає вмісту",
             # щоб не засмічувати лог помилками 404.
@@ -115,8 +128,12 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(404, "Маршрут не знайдено")
 
     def do_POST(self):
-        if self.path == "/upload":
+        path = urlparse(self.path).path
+        delete_match = DELETE_ROUTE.match(path)
+        if path == "/upload":
             self._handle_upload()
+        elif delete_match:
+            self._handle_delete(int(delete_match.group(1)))
         else:
             logging.info(f"Помилка: маршрут POST {self.path} не знайдено.")
             self._send_error(404, "Маршрут не знайдено")
@@ -161,10 +178,10 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if rows:
-            table_rows = "\n".join(self._render_image_row(row) for row in rows)
+            table_rows = "\n".join(self._render_image_row(row, page) for row in rows)
         else:
             table_rows = (
-                '<tr><td colspan="5" class="empty">Немає завантажених зображень</td></tr>')
+                '<tr><td colspan="6" class="empty">Немає завантажених зображень</td></tr>')
 
         template = (STATIC_DIR / "images_list.html").read_text(encoding="utf-8")
         page_html = (template
@@ -172,6 +189,64 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
                      .replace("<!--PAGINATION-->",
                               self._render_pagination(page, total_pages, total)))
         self._send_html(200, page_html)
+
+    def _handle_delete(self, image_id: int):
+        """Видаляє запис з БД і файл з диска, потім повертає на список."""
+        page = self._get_page_number()
+        back_url = f"/images-list?page={page}"
+
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT filename FROM images WHERE id = %s", (image_id,))
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    logging.info(f"Помилка: зображення з id={image_id} не знайдено в базі даних.")
+                    self._send_error(
+                        404, f"Зображення з id={image_id} не знайдено", back_url=back_url)
+                    return
+
+                filename = row[0]
+                cur.execute("DELETE FROM images WHERE id = %s", (image_id,))
+
+            # Файл видаляємо до commit: якщо не вийде, запис у БД залишиться.
+            file_path = (IMAGES_DIR / filename).resolve()
+            if IMAGES_DIR.resolve() not in file_path.parents:
+                conn.rollback()
+                logging.error(f"Помилка: некоректна назва файлу в БД ({filename}), id={image_id}.")
+                self._send_error(400, "Некоректна назва файлу", back_url=back_url)
+                return
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                logging.warning(
+                    f"Попередження: файл {filename} (id={image_id}) відсутній на диску, "
+                    f"видаляю лише запис з бази даних.")
+
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn is not None:
+                conn.rollback()
+            logging.error(
+                f"Помилка: не вдалося видалити зображення id={image_id} з бази даних. Причина: {e}")
+            self._send_error(500, "Помилка бази даних, зображення не видалено", back_url=back_url)
+            return
+        except OSError as e:
+            if conn is not None:
+                conn.rollback()
+            logging.error(
+                f"Помилка: не вдалося видалити файл зображення id={image_id} з диска. Причина: {e}")
+            self._send_error(500, "Не вдалося видалити файл, зображення не видалено",
+                             back_url=back_url)
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        logging.info(f"Успіх: зображення {filename} (id={image_id}) видалено.")
+        self._redirect(back_url)
 
     def _get_page_number(self) -> int:
         """Номер сторінки з ?page=N. Некоректне або менше 1 значення -> 1."""
@@ -208,7 +283,7 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             "</nav>")
 
     @staticmethod
-    def _render_image_row(row) -> str:
+    def _render_image_row(row, page: int) -> str:
         image_id, filename, original_name, size, upload_time, file_type = row
         name = html.escape(filename)
         original = html.escape(original_name)
@@ -222,6 +297,12 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
             f'<td class="num">{size_kb}</td>'
             f"<td>{uploaded}</td>"
             f"<td>{html.escape(file_type)}</td>"
+            "<td>"
+            f'<form method="post" action="/delete/{image_id}?page={page}" class="delete-form" '
+            "onsubmit=\"return confirm('Видалити це зображення?');\">"
+            '<button type="submit" class="delete-btn">Видалити</button>'
+            "</form>"
+            "</td>"
             "</tr>")
 
     def _handle_upload(self):
@@ -376,9 +457,9 @@ class ImageHostingHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_error(self, status: int, message: str):
-
-        body = (f"<html><body><h1>{status}</h1><p>{message}</p></body></html>").encode("utf-8")
+    def _send_error(self, status: int, message: str, back_url: str = None):
+        back = f'<p><a href="{back_url}">&larr; Повернутися до списку</a></p>' if back_url else ""
+        body = (f"<html><body><h1>{status}</h1><p>{message}</p>{back}</body></html>").encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
