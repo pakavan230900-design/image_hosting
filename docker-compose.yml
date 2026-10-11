@@ -1,20 +1,48 @@
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: postgres_container
+    environment:
+      POSTGRES_DB: images_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d images_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   app:
     build: .
     expose:
       - "8000"
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: images_db
+      DB_USER: postgres
+      DB_PASSWORD: password
     volumes:
       - ./images:/app/images
       - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   nginx:
     image: nginx:alpine
     ports:
-      - "8080:80"     
+      - "8080:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./images:/usr/share/nginx/images:ro
     depends_on:
       - app
     restart: unless-stopped
+
+volumes:
+  db_data:

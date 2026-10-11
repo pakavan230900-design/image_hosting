@@ -5,4 +5,6 @@ images/*
 !images/.gitkeep
 logs/*
 !logs/.gitkeep
+backups/*
+!backups/.gitkeep
 .DS_Store
